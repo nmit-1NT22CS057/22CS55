@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.example.zerodef.network.*
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -32,6 +33,8 @@ class ZeroDefVpnService : VpnService() {
         var isRunning = false
         const val ACTION_START = "com.example.zerodef.START_VPN"
         const val ACTION_STOP = "com.example.zerodef.STOP_VPN"
+        const val BROADCAST_VPN_STATE = "com.example.zerodef.VPN_STATE"
+        private const val DNS_SERVER = "8.8.8.8"
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -49,18 +52,19 @@ class ZeroDefVpnService : VpnService() {
 
     private fun startVpn() {
         isRunning = true
+        sendStateBroadcast()
         startForeground(1, createNotification())
 
         val builder = Builder()
         builder.setSession("ZeroDef VPN")
         builder.addAddress("10.0.0.2", 32)
-        builder.addDnsServer("8.8.8.8")
+        builder.addDnsServer(DNS_SERVER)
         builder.addRoute("0.0.0.0", 0)
         vpnInterface = builder.establish()!!
 
         vpnInput = FileInputStream(vpnInterface!!.fileDescriptor)
         vpnOutput = FileOutputStream(vpnInterface!!.fileDescriptor)
-        networkToDeviceQueue = ArrayBlockingQueue(1000)
+        networkToDeviceQueue = ArrayBlockingQueue(2000)
 
         nioManager = NioManager(networkToDeviceQueue, this)
         executor = Executors.newFixedThreadPool(3) // Reader, Writer, NioManager
@@ -77,12 +81,13 @@ class ZeroDefVpnService : VpnService() {
                     val readBytes = vpnInput.read(buffer.array())
                     if (readBytes > 0) {
                         val packetData = buffer.array().copyOf(readBytes)
-                        val packet = Packet(ByteBuffer.wrap(packetData))
-                        nioManager.processPacket(packet)
+                        nioManager.processPacket(Packet(ByteBuffer.wrap(packetData)))
                     }
                     buffer.clear()
                 } catch (e: IOException) {
-                    Log.e("VpnService", "Error reading from VPN", e)
+                    if (isRunning) Log.e("VpnService", "Error reading from VPN", e)
+                } catch (e: Exception) {
+                    if (isRunning) Log.e("VpnService", "DeviceReader exception", e)
                 }
             }
         }
@@ -97,7 +102,7 @@ class ZeroDefVpnService : VpnService() {
                 } catch (e: InterruptedException) {
                     Thread.currentThread().interrupt()
                 } catch (e: IOException) {
-                    Log.e("VpnService", "Error writing to VPN", e)
+                   if (isRunning) Log.e("VpnService", "Error writing to VPN", e)
                 }
             }
         }
@@ -105,6 +110,7 @@ class ZeroDefVpnService : VpnService() {
 
     private fun stopVpn() {
         isRunning = false
+        sendStateBroadcast()
         if (this::executor.isInitialized) {
             executor.shutdownNow()
         }
@@ -112,6 +118,12 @@ class ZeroDefVpnService : VpnService() {
         try { vpnInterface?.close() } catch (e: IOException) {}
         stopForeground(true)
         stopSelf()
+    }
+
+    private fun sendStateBroadcast() {
+        val intent = Intent(BROADCAST_VPN_STATE)
+        intent.putExtra("isRunning", isRunning)
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
 
     override fun onDestroy() {

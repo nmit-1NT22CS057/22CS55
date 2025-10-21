@@ -5,4 +5,5 @@ class TCPState {
     var clientAck: Long = 0
     var serverSeq: Long = 0
     var serverAck: Long = 0
+    var lastActivity: Long = System.currentTimeMillis()
 }

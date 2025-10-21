@@ -1,6 +1,9 @@
 package com.example.zerodef
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.VpnService
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -12,10 +15,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -29,10 +30,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.example.zerodef.ui.theme.ZeroDefTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -41,13 +42,7 @@ class MainActivity : ComponentActivity() {
     ) { result ->
         if (result.resultCode == RESULT_OK) {
             startVpnService()
-        } else {
-            updateVpnState(false)
         }
-    }
-
-    private fun updateVpnState(running: Boolean) {
-        ZeroDefVpnService.isRunning = running
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,7 +77,6 @@ class MainActivity : ComponentActivity() {
             action = ZeroDefVpnService.ACTION_START
         }
         startService(intent)
-        updateVpnState(true)
     }
 
     private fun stopVpnService() {
@@ -90,7 +84,6 @@ class MainActivity : ComponentActivity() {
             action = ZeroDefVpnService.ACTION_STOP
         }
         startService(intent)
-        updateVpnState(false)
     }
 }
 
@@ -101,23 +94,21 @@ fun VpnControlScreen(modifier: Modifier = Modifier, onVpnToggle: (Boolean) -> Un
     var isLoading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    // Update the UI state when the service state changes
-    DisposableEffect(Unit) {
-        val checkInterval = 1000L // 1 second
-        val job = scope.launch(Dispatchers.Default) {
-            while (true) {
-                val currentVpnState = ZeroDefVpnService.isRunning
-                if (vpnRunning != currentVpnState) {
-                    withContext(Dispatchers.Main) {
-                        vpnRunning = currentVpnState
-                        isLoading = false
-                    }
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == ZeroDefVpnService.BROADCAST_VPN_STATE) {
+                    vpnRunning = intent.getBooleanExtra("isRunning", false)
+                    isLoading = false
                 }
-                kotlinx.coroutines.delay(checkInterval)
             }
         }
+        LocalBroadcastManager.getInstance(context).registerReceiver(
+            receiver,
+            IntentFilter(ZeroDefVpnService.BROADCAST_VPN_STATE)
+        )
         onDispose {
-            job.cancel()
+            LocalBroadcastManager.getInstance(context).unregisterReceiver(receiver)
         }
     }
 
@@ -137,6 +128,7 @@ fun VpnControlScreen(modifier: Modifier = Modifier, onVpnToggle: (Boolean) -> Un
                 onClick = {
                     val newState = !vpnRunning
                     isLoading = true
+                    // Use a coroutine to ensure UI remains responsive
                     scope.launch(Dispatchers.IO) {
                         onVpnToggle(newState)
                     }

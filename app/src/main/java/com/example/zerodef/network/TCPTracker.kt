@@ -1,7 +1,6 @@
 package com.example.zerodef.network
 
 import android.net.VpnService
-import android.util.Log
 import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -47,5 +46,15 @@ class TCPTracker(private val vpnService: VpnService) {
         channels.values.forEach { it.close() }
         channels.clear()
         states.clear()
+    }
+
+    fun cleanupIdleConnections(now: Long, timeout: Long) {
+        states.entries.removeIf { 
+            val shouldRemove = now - it.value.lastActivity > timeout
+            if (shouldRemove) {
+                channels.remove(it.key)?.close()
+            }
+            shouldRemove
+        }
     }
 }

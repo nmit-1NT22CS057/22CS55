@@ -20,24 +20,31 @@ class NioManager(
     private val buffer = ByteBuffer.allocate(32767)
     private val tcpTracker = TCPTracker(vpnService)
     private val udpTracker = UDPTracker(vpnService)
+    private var lastCleanup = 0L
 
     companion object {
         const val TAG = "NioManager"
+        const val IDLE_TIMEOUT_MS = 30000L // 30 seconds
     }
 
     fun processPacket(packet: Packet) {
-        when (packet.ipHeader.protocol) {
-            Protocol.TCP -> handleTcpPacket(packet)
-            Protocol.UDP -> handleUdpPacket(packet)
-            else -> {}
+        try {
+            when (packet.ipHeader.protocol) {
+                Protocol.TCP -> handleTcpPacket(packet)
+                Protocol.UDP -> handleUdpPacket(packet)
+                else -> {}
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing packet", e)
         }
     }
 
     private fun handleTcpPacket(packet: Packet) {
         val tcpHeader = packet.transportHeader as TCPHeader
         val connection = TCPConnection(packet.ipHeader.sourceAddress, tcpHeader.sourcePort, packet.ipHeader.destinationAddress, tcpHeader.destinationPort)
-
         val state = tcpTracker.getState(connection)
+
+        state?.lastActivity = System.currentTimeMillis()
 
         if (tcpHeader.flags and TCP_FLAG_SYN != 0 && state == null) {
             val channel = tcpTracker.getOrCreateChannel(connection) ?: return
@@ -54,21 +61,15 @@ class NioManager(
         if (state == null) return
 
         if (tcpHeader.flags and TCP_FLAG_FIN != 0) {
-            val finAckPacket = buildTcpPacket(
-                packet.ipHeader,
-                tcpHeader,
-                ByteBuffer.allocate(0),
-                TCP_FLAG_FIN or TCP_FLAG_ACK,
-                tcpHeader.sequenceNumber + 1,
-                tcpHeader.acknowledgmentNumber
-            )
+            state.clientSeq += 1
+            val finAckPacket = buildTcpPacket(packet.ipHeader, tcpHeader, ByteBuffer.allocate(0), TCP_FLAG_FIN or TCP_FLAG_ACK, state.serverSeq, state.clientSeq)
             networkToDeviceQueue.offer(finAckPacket)
-            tcpTracker.closeConnection(connection)
+            cleanupConnection(connection, null)
             return
         }
 
         if (tcpHeader.flags and TCP_FLAG_RST != 0) {
-            tcpTracker.closeConnection(connection)
+            cleanupConnection(connection, null)
             return
         }
 
@@ -80,21 +81,12 @@ class NioManager(
             if (payload.remaining() > 0) {
                 try {
                     val bytesWritten = channel.write(payload)
-                    val ackForDevice = tcpHeader.sequenceNumber + bytesWritten
-                    state.clientSeq += bytesWritten
-
-                    val ackPacket = buildTcpPacket(
-                        packet.ipHeader,
-                        tcpHeader,
-                        ByteBuffer.allocate(0),
-                        TCP_FLAG_ACK,
-                        ackForDevice,      // Use the correctly calculated ACK number
-                        state.serverSeq    // The server's sequence number is correct here
-                    )
+                    state.serverAck += bytesWritten
+                    val ackPacket = buildTcpPacket(packet.ipHeader, tcpHeader, ByteBuffer.allocate(0), TCP_FLAG_ACK, state.serverSeq, state.serverAck)
                     networkToDeviceQueue.offer(ackPacket)
                 } catch (e: IOException) {
                     Log.e(TAG, "Failed to write to TCP channel", e)
-                    tcpTracker.closeConnection(connection)
+                    cleanupConnection(connection, null)
                 }
             }
         }
@@ -105,12 +97,13 @@ class NioManager(
         val connection = UDPConnection(packet.ipHeader.sourceAddress, udpHeader.sourcePort, packet.ipHeader.destinationAddress, udpHeader.destinationPort)
         val channel = udpTracker.getOrCreateChannel(connection) ?: return
 
-        val key = channel.register(selector, SelectionKey.OP_READ)
-        key.attach(packet)
+        if (channel.keyFor(selector) == null) {
+            val key = channel.register(selector, SelectionKey.OP_READ)
+            key.attach(packet)
+        }
 
-        val payload = packet.payload
         try {
-            channel.write(payload)
+            channel.write(packet.payload)
         } catch (e: IOException) {
             Log.e(TAG, "Failed to write to UDP channel", e)
             udpTracker.closeConnection(connection)
@@ -120,9 +113,8 @@ class NioManager(
     override fun run() {
         while (!Thread.currentThread().isInterrupted) {
             try {
-                val readyChannels = selector.select()
-                if (readyChannels == 0) {
-                    Thread.sleep(10)
+                if (selector.select(1000) == 0) {
+                    cleanupIdleConnections()
                     continue
                 }
 
@@ -134,128 +126,83 @@ class NioManager(
 
                     if (!key.isValid) continue
 
-                    when {
-                        key.isConnectable -> handleConnect(key)
-                        key.isReadable -> handleRead(key)
+                    if (key.isConnectable) {
+                        handleConnect(key)
+                    } else if (key.isReadable) {
+                        handleRead(key)
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "NioManager error", e)
+                Log.e(TAG, "NioManager run loop CRITICAL error", e)
             }
         }
     }
 
     private fun handleConnect(key: SelectionKey) {
         val channel = key.channel() as SocketChannel
-        val packet = key.attachment() as Packet
-        val tcpHeader = packet.transportHeader as TCPHeader
-        val connection = TCPConnection(packet.ipHeader.sourceAddress, tcpHeader.sourcePort, packet.ipHeader.destinationAddress, tcpHeader.destinationPort)
-        val state = tcpTracker.getState(connection)!!
+        val originalPacket = key.attachment() as Packet
+        val originalTcpHeader = originalPacket.transportHeader as TCPHeader
+        val connection = TCPConnection(originalPacket.ipHeader.sourceAddress, originalTcpHeader.sourcePort, originalPacket.ipHeader.destinationAddress, originalTcpHeader.destinationPort)
+        val state = tcpTracker.getState(connection) ?: return
 
         try {
             if (channel.finishConnect()) {
                 key.interestOps(SelectionKey.OP_READ)
-
-                val synAckPacket = buildTcpPacket(
-                    packet.ipHeader,
-                    tcpHeader,
-                    ByteBuffer.allocate(0),
-                    TCP_FLAG_SYN or TCP_FLAG_ACK,
-                    state.serverAck,
-                    state.serverSeq
-                )
+                state.lastActivity = System.currentTimeMillis()
+                val synAckPacket = buildTcpPacket(originalPacket.ipHeader, originalTcpHeader, ByteBuffer.allocate(0), TCP_FLAG_SYN or TCP_FLAG_ACK, state.serverSeq, state.serverAck)
                 networkToDeviceQueue.offer(synAckPacket)
                 state.serverSeq++
             }
         } catch (e: IOException) {
-            Log.e(TAG, "Connection failed", e)
-            key.cancel()
+            Log.e(TAG, "Connection failed: $connection", e)
+            cleanupConnection(connection, key)
         }
     }
 
     private fun handleRead(key: SelectionKey) {
-        when (key.channel()) {
-            is SocketChannel -> readTcp(key)
-            is DatagramChannel -> readUdp(key)
+        when (val channel = key.channel()) {
+            is SocketChannel -> readTcp(key, channel)
+            is DatagramChannel -> readUdp(key, channel)
         }
     }
 
-    private fun readTcp(key: SelectionKey) {
-        val channel = key.channel() as SocketChannel
-        val originalPacketFromDevice = key.attachment() as Packet
-        val originalTcpHeader = originalPacketFromDevice.transportHeader as TCPHeader
-
-        val connection = TCPConnection(
-            originalPacketFromDevice.ipHeader.sourceAddress,
-            originalTcpHeader.sourcePort,
-            originalPacketFromDevice.ipHeader.destinationAddress,
-            originalTcpHeader.destinationPort
-        )
+    private fun readTcp(key: SelectionKey, channel: SocketChannel) {
+        val originalPacket = key.attachment() as Packet
+        val originalTcpHeader = originalPacket.transportHeader as TCPHeader
+        val connection = TCPConnection(originalPacket.ipHeader.sourceAddress, originalTcpHeader.sourcePort, originalPacket.ipHeader.destinationAddress, originalTcpHeader.destinationPort)
         val state = tcpTracker.getState(connection)
 
-        if (state == null) {
-            key.cancel()
-            channel.close()
-            return
-        }
+        if (state == null) { cleanupConnection(connection, key); return }
+
+        state.lastActivity = System.currentTimeMillis()
 
         try {
             buffer.clear()
             val bytesRead = channel.read(buffer)
             if (bytesRead == -1) {
-                key.cancel()
-                channel.close()
-
-                val finPacket = buildTcpPacket(
-                    originalPacketFromDevice.ipHeader,
-                    originalTcpHeader,
-                    ByteBuffer.allocate(0),
-                    TCP_FLAG_FIN or TCP_FLAG_ACK,
-                    state.serverAck, 
-                    state.serverSeq 
-                )
+                val finPacket = buildTcpPacket(originalPacket.ipHeader, originalTcpHeader, ByteBuffer.allocate(0), TCP_FLAG_FIN or TCP_FLAG_ACK, state.serverSeq, state.serverAck)
                 networkToDeviceQueue.offer(finPacket)
-                tcpTracker.closeConnection(connection)
+                cleanupConnection(connection, key)
             } else if (bytesRead > 0) {
                 buffer.flip()
-
-                val responseSeqNumber = state.serverSeq
-                val responseAckNumber = state.serverAck
-
-                val responsePacket = buildTcpPacket(
-                    originalPacketFromDevice.ipHeader,
-                    originalTcpHeader,
-                    buffer, 
-                    TCP_FLAG_PSH or TCP_FLAG_ACK,
-                    responseAckNumber,
-                    responseSeqNumber
-                )
+                val responsePacket = buildTcpPacket(originalPacket.ipHeader, originalTcpHeader, buffer, TCP_FLAG_PSH or TCP_FLAG_ACK, state.serverSeq, state.serverAck)
                 networkToDeviceQueue.offer(responsePacket)
-                
                 state.serverSeq += bytesRead
             }
         } catch (e: IOException) {
-            Log.e(TAG, "TCP Read error", e)
-            key.cancel()
-            channel.close()
-            tcpTracker.closeConnection(connection)
+            Log.e(TAG, "TCP Read error: $connection", e)
+            cleanupConnection(connection, key)
         }
     }
 
-    private fun readUdp(key: SelectionKey) {
-        val channel = key.channel() as DatagramChannel
-        val packet = key.attachment() as Packet
-
+    private fun readUdp(key: SelectionKey, channel: DatagramChannel) {
+        val originalPacket = key.attachment() as Packet
         try {
             buffer.clear()
             val bytesRead = channel.read(buffer)
             if (bytesRead > 0) {
                 buffer.flip()
-                val responsePacket = buildUdpPacket(
-                    packet.ipHeader,
-                    packet.transportHeader as UDPHeader,
-                    buffer
-                )
+                val responsePacket = buildUdpPacket(originalPacket.ipHeader, originalPacket.transportHeader as UDPHeader, buffer)
                 networkToDeviceQueue.offer(responsePacket)
             }
         } catch (e: IOException) {
@@ -263,9 +210,26 @@ class NioManager(
         }
     }
 
+    private fun cleanupIdleConnections() {
+        val now = System.currentTimeMillis()
+        if (now - lastCleanup < 5000L) return // Cleanup every 5 seconds
+
+        tcpTracker.cleanupIdleConnections(now, IDLE_TIMEOUT_MS)
+        lastCleanup = now
+    }
+
+    private fun cleanupConnection(connection: TCPConnection, key: SelectionKey?) {
+        key?.cancel()
+        tcpTracker.closeConnection(connection)
+    }
+
     override fun close() {
-        selector.close()
-        tcpTracker.closeAll()
-        udpTracker.closeAll()
+        try {
+            selector.close()
+            tcpTracker.closeAll()
+            udpTracker.closeAll()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing NioManager resources", e)
+        }
     }
 }
