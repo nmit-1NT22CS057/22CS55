@@ -128,7 +128,6 @@ fun VpnControlScreen(modifier: Modifier = Modifier, onVpnToggle: (Boolean) -> Un
                 onClick = {
                     val newState = !vpnRunning
                     isLoading = true
-                    // Use a coroutine to ensure UI remains responsive
                     scope.launch(Dispatchers.IO) {
                         onVpnToggle(newState)
                     }

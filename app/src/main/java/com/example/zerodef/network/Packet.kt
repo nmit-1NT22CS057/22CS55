@@ -13,6 +13,16 @@ interface TransportHeader {
     val headerLength: Int
 }
 
+const val IPV4_HEADER_SIZE = 20
+const val TCP_HEADER_SIZE = 20
+const val UDP_HEADER_SIZE = 8
+
+const val TCP_FLAG_SYN = 0x02
+const val TCP_FLAG_ACK = 0x10
+const val TCP_FLAG_PSH = 0x08
+const val TCP_FLAG_FIN = 0x01
+const val TCP_FLAG_RST = 0x04
+
 data class IPV4Header(
     val version: Int,
     val ihl: Int,
@@ -91,6 +101,12 @@ data class TCPHeader(
     val urgentPointer: Int
 ) : TransportHeader {
     override val headerLength: Int = dataOffset * 4
+
+    val isSYN: Boolean get() = (flags and TCP_FLAG_SYN) != 0
+    val isACK: Boolean get() = (flags and TCP_FLAG_ACK) != 0
+    val isFIN: Boolean get() = (flags and TCP_FLAG_FIN) != 0
+    val isRST: Boolean get() = (flags and TCP_FLAG_RST) != 0
+    val isPSH: Boolean get() = (flags and TCP_FLAG_PSH) != 0
 
     companion object {
         fun fromByteBuffer(buffer: ByteBuffer): TCPHeader {
