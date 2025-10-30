@@ -25,7 +25,7 @@ data class Connection(
 class ConnectionTracker(private val vpnService: VpnService) {
     private val channels = ConcurrentHashMap<String, SelectableChannel>()
     private val states = ConcurrentHashMap<String, TCPState>()
-    private val bufferPool = DirectBufferPool(32, 65536)
+    private val bufferPool = DirectBufferPool(32, 16384)
 
     private val connectionPool = ConnectionPool(100)
     private val activeConnections = AtomicInteger(0)
@@ -80,8 +80,8 @@ class ConnectionTracker(private val vpnService: VpnService) {
         socket.keepAlive = true
         socket.tcpNoDelay = true
         socket.reuseAddress = true
-        socket.receiveBufferSize = 65536
-        socket.sendBufferSize = 65536
+        socket.receiveBufferSize = 16384
+        socket.sendBufferSize = 16384
 
         channel.connect(InetSocketAddress(connection.destAddress, connection.destPort))
         return channel
@@ -98,8 +98,8 @@ class ConnectionTracker(private val vpnService: VpnService) {
 
         val socket = channel.socket()
         socket.reuseAddress = true
-        socket.receiveBufferSize = 65536
-        socket.sendBufferSize = 65536
+        socket.receiveBufferSize = 16384
+        socket.sendBufferSize = 16384
 
         channel.connect(InetSocketAddress(connection.destAddress, connection.destPort))
         return channel
@@ -148,7 +148,7 @@ class ConnectionTracker(private val vpnService: VpnService) {
         }
 
         if (cleaned > 0) {
-            Log.d(TAG, "Cleaned up $cleaned idle connections")
+            Log.i(TAG, "Cleaned up $cleaned idle connections")
         }
     }
 

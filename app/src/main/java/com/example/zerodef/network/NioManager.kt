@@ -30,7 +30,7 @@ class NioManager(
     companion object {
         const val TAG = "NioManager"
         const val IDLE_TIMEOUT_MS = 15000L
-        const val SELECT_TIMEOUT_MS = 50L
+        const val SELECT_TIMEOUT_MS = 20L
         const val CLEANUP_INTERVAL_MS = 2000L
         const val STATS_INTERVAL_MS = 10000L
     }
@@ -95,7 +95,7 @@ class NioManager(
                 cleanupConnection(key.attachment() as? Connection, key)
             } catch (e: IOException) {
                 val connection = key.attachment() as? Connection
-                Log.d(TAG, "IO error for $connection: ${e.message}")
+                Log.w(TAG, "IO error for $connection: ${e.message}")
                 cleanupConnection(connection, key)
             }
         }
