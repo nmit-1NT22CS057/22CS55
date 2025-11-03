@@ -11,206 +11,364 @@ import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
-data class Connection(
+// --- PHASE 3: Upgraded for IPv6 Support ---
+data class ConnectionKey(
     val protocol: Protocol,
     val sourceAddress: InetAddress,
     val sourcePort: Int,
     val destAddress: InetAddress,
-    val destPort: Int,
-    val connectionId: Long = System.nanoTime()
+    val destPort: Int
+)
+
+class Connection(
+
+    val channel: SelectableChannel,
+    // --- FINAL REWORK: A proxy only manages ONE custom TCP state: the client's. ---
+    val clientState: TCPState // Manages client <-> vpn
+
 ) {
-    val key: String = "$protocol:${sourceAddress.hostAddress}:$sourcePort-${destAddress.hostAddress}:$destPort"
+
+    fun updateActivity() {
+
+        clientState.lastActivity = System.currentTimeMillis()
+
+    }
+
 }
+
+
 
 class ConnectionTracker(private val vpnService: VpnService) {
-    private val channels = ConcurrentHashMap<String, SelectableChannel>()
-    private val states = ConcurrentHashMap<String, TCPState>()
-    private val bufferPool = DirectBufferPool(32, 16384)
 
-    private val connectionPool = ConnectionPool(100)
+    private val connections = ConcurrentHashMap<ConnectionKey, Connection>()
+
+    // --- Made internal to be accessible from NioManager ---
+
+    internal val bufferPool = DirectBufferPool(32, 65536)
+
     private val activeConnections = AtomicInteger(0)
 
+
+
     companion object {
+
         const val TAG = "ConnectionTracker"
-        const val MAX_CONNECTIONS = 500
+
+        // --- PHASE 2: Connection Limiting ---
+
+        const val MAX_CONNECTIONS = 1000
+
+        const val SOCKET_BUFFER_SIZE = 65536
+
     }
 
-    fun getOrCreateChannel(connection: Connection): SelectableChannel? {
+
+
+    fun getConnection(key: ConnectionKey): Connection? {
+
+        return connections[key]
+
+    }
+
+
+
+    // --- PHASE 2: Enforce Connection Limiting ---
+
+    fun createAndTrackConnection(key: ConnectionKey): Connection? {
+
         if (activeConnections.get() >= MAX_CONNECTIONS) {
-            Log.w(TAG, "Maximum connections reached, rejecting new connection")
+
+            Log.w(TAG, "Maximum connections reached, rejecting new connection for $key")
+
             return null
+
         }
 
-        return channels[connection.key] ?: tryCreateChannel(connection)
-    }
 
-    private fun tryCreateChannel(connection: Connection): SelectableChannel? {
+
         return try {
-            val newChannel = when (connection.protocol) {
-                Protocol.TCP -> createOptimizedSocketChannel(connection)
-                Protocol.UDP -> createOptimizedDatagramChannel(connection)
+
+            val newChannel = when (key.protocol) {
+
+                Protocol.TCP -> createOptimizedSocketChannel(key)
+
+                Protocol.UDP -> createOptimizedDatagramChannel(key)
+
                 else -> null
+
             }
+
+
 
             newChannel?.let { channel ->
-                channels[connection.key] = channel
-                if (connection.protocol == Protocol.TCP) {
-                    states[connection.key] = TCPState()
-                }
+
+                val newConnection = Connection(
+
+                    channel = channel,
+
+                    // --- FINAL REWORK: Initialize client state only ---
+
+                    clientState = TCPState()
+
+                )
+
+                connections[key] = newConnection
+
                 activeConnections.incrementAndGet()
-                channel
+
+                newConnection
+
             }
+
         } catch (e: IOException) {
-            Log.w(TAG, "Failed to create channel for $connection: ${e.message}")
+
+            Log.w(TAG, "Failed to create channel for $key: ${e.message}")
+
             null
+
         }
+
     }
 
-    private fun createOptimizedSocketChannel(connection: Connection): SocketChannel {
+
+
+    private fun createOptimizedSocketChannel(key: ConnectionKey): SocketChannel {
+
         val channel = SocketChannel.open()
+
         channel.configureBlocking(false)
 
-        if (!vpnService.protect(channel.socket())) {
-            channel.close()
-            throw IOException("Failed to protect socket")
+        vpnService.protect(channel.socket()) || throw IOException("Failed to protect TCP socket")
+
+
+
+        channel.socket().apply {
+
+            soTimeout = 15000
+
+            keepAlive = true
+
+            tcpNoDelay = true
+
+            reuseAddress = true
+
+            receiveBufferSize = SOCKET_BUFFER_SIZE
+
+            sendBufferSize = SOCKET_BUFFER_SIZE
+
         }
 
-        val socket = channel.socket()
-        socket.soTimeout = 15000
-        socket.keepAlive = true
-        socket.tcpNoDelay = true
-        socket.reuseAddress = true
-        socket.receiveBufferSize = 16384
-        socket.sendBufferSize = 16384
 
-        channel.connect(InetSocketAddress(connection.destAddress, connection.destPort))
+
+        channel.connect(InetSocketAddress(key.destAddress, key.destPort))
+
         return channel
+
     }
 
-    private fun createOptimizedDatagramChannel(connection: Connection): DatagramChannel {
+
+
+    private fun createOptimizedDatagramChannel(key: ConnectionKey): DatagramChannel {
+
         val channel = DatagramChannel.open()
+
         channel.configureBlocking(false)
 
-        if (!vpnService.protect(channel.socket())) {
-            channel.close()
-            throw IOException("Failed to protect socket")
+        vpnService.protect(channel.socket()) || throw IOException("Failed to protect UDP socket")
+
+
+
+        channel.socket().apply {
+
+            reuseAddress = true
+
+            receiveBufferSize = SOCKET_BUFFER_SIZE
+
+            sendBufferSize = SOCKET_BUFFER_SIZE
+
         }
 
-        val socket = channel.socket()
-        socket.reuseAddress = true
-        socket.receiveBufferSize = 16384
-        socket.sendBufferSize = 16384
 
-        channel.connect(InetSocketAddress(connection.destAddress, connection.destPort))
+
+        channel.connect(InetSocketAddress(key.destAddress, key.destPort))
+
         return channel
+
     }
 
-    fun getState(connection: Connection): TCPState? = states[connection.key]
 
-    fun getBuffer(): ByteBuffer = bufferPool.borrowBuffer()
 
-    fun returnBuffer(buffer: ByteBuffer) = bufferPool.returnBuffer(buffer)
+    fun getAllTcpConnections(): List<Pair<ConnectionKey, Connection>> = connections.entries
 
-    fun closeConnection(connection: Connection) {
-        try {
-            channels.remove(connection.key)?.close()
-            states.remove(connection.key)
-            activeConnections.decrementAndGet()
-        } catch (e: IOException) {
-            // Ignore close errors
+        .filter { it.key.protocol == Protocol.TCP }
+
+        .map { it.key to it.value }
+
+
+
+    fun getBufferPool(): DirectBufferPool = bufferPool
+
+
+
+    fun closeConnection(key: ConnectionKey) {
+
+        connections.remove(key)?.let { connection ->
+
+            try {
+
+                connection.channel.close()
+
+            } catch (e: IOException) {
+
+                // Ignore close errors
+
+            } finally {
+
+                activeConnections.decrementAndGet()
+
+            }
+
         }
+
     }
+
+
 
     fun closeAll() {
-        channels.values.forEach {
-            try { it.close() } catch (e: IOException) { /* ignore */ }
+
+        connections.values.forEach {
+
+            try { it.channel.close() } catch (e: IOException) { /* ignore */ }
+
         }
-        channels.clear()
-        states.clear()
+
+        connections.clear()
+
         bufferPool.clear()
+
         activeConnections.set(0)
+
     }
 
-    fun cleanupIdleConnections(now: Long, timeout: Long) {
-        val iterator = states.entries.iterator()
-        var cleaned = 0
 
-        while (iterator.hasNext()) {
-            val (key, state) = iterator.next()
-            if (now - state.lastActivity > timeout) {
-                channels.remove(key)?.close()
-                iterator.remove()
-                activeConnections.decrementAndGet()
-                cleaned++
-            }
-
-            if (cleaned >= 10) break
-        }
-
-        if (cleaned > 0) {
-            Log.i(TAG, "Cleaned up $cleaned idle connections")
-        }
-    }
 
     fun getStats(): String {
+
         return "Connections: ${activeConnections.get()}, Buffers: ${bufferPool.getStats()}"
+
     }
+
 }
+
+
 
 class DirectBufferPool(private val maxBuffers: Int, private val bufferSize: Int) {
+
     private val availableBuffers = LinkedList<ByteBuffer>()
+
     private val createdCount = AtomicInteger(0)
 
+    private val borrowedCount = AtomicInteger(0)
+
+    private val returnedCount = AtomicInteger(0)
+
+
+
     fun borrowBuffer(): ByteBuffer {
+
+        borrowedCount.incrementAndGet()
+
         synchronized(availableBuffers) {
+
             return if (availableBuffers.isNotEmpty()) {
+
                 val buffer = availableBuffers.removeFirst()
+
                 buffer.clear()
+
                 buffer
+
             } else {
+
                 createNewBuffer()
+
             }
+
         }
+
     }
+
+
 
     fun returnBuffer(buffer: ByteBuffer) {
+
+        returnedCount.incrementAndGet()
+
         synchronized(availableBuffers) {
-            if (availableBuffers.size < maxBuffers) {
+
+            if (availableBuffers.size < maxBuffers && buffer.capacity() == bufferSize) {
+
+                buffer.clear()
+
                 availableBuffers.addLast(buffer)
+
             }
+
         }
+
     }
+
+
 
     private fun createNewBuffer(): ByteBuffer {
-        createdCount.incrementAndGet()
+
+        val count = createdCount.incrementAndGet()
+
+        if (count > maxBuffers * 2) {
+
+            Log.w("DirectBufferPool", "Creating many buffers: $count")
+
+        }
+
         return ByteBuffer.allocateDirect(bufferSize)
+
     }
+
+
 
     fun clear() {
+
         synchronized(availableBuffers) {
+
             availableBuffers.clear()
+
         }
+
     }
 
-    fun getStats(): String = "available=${availableBuffers.size}, created=$createdCount"
+
+
+    fun getStats(): String =
+
+        "available=${availableBuffers.size}, created=$createdCount, " +
+
+                "borrowed=$borrowedCount, returned=$returnedCount"
+
 }
 
-class ConnectionPool(private val maxSize: Int) {
-    private val pool = LinkedHashMap<String, Long>(maxSize, 0.75f, true)
 
-    @Synchronized
-    fun touch(connectionKey: String) {
-        pool[connectionKey] = System.currentTimeMillis()
 
-        if (pool.size > maxSize) {
-            val iterator = pool.entries.iterator()
-            if (iterator.hasNext()) {
-                iterator.next()
-                iterator.remove()
-            }
-        }
-    }
 
-    @Synchronized
-    fun contains(connectionKey: String): Boolean = pool.containsKey(connectionKey)
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
